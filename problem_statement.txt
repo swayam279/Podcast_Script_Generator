@@ -1,0 +1,10 @@
+Podcast Script Producer
+
+Problem Statement: Creating a podcast script that sounds natural for multiple personas requires significant research, planning, and back-and-forth editing. Doing this manually for each episode is repetitive and slow, especially when balancing different guest voices and perspectives.
+
+Expected Outcomes:
+
+Given a topic and two personas, the system produces a full interview-style script
+Each guest's responses are clearly distinct in tone and voice
+Human can review and rewrite any segment before the next one is generated
+Production can be paused and resumed across multiple sessions without losing progress
