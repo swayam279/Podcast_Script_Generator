@@ -2,3 +2,4 @@
 .env
 .vscode
 server.log
+script.db
