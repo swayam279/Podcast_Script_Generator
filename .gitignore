@@ -3,3 +3,4 @@
 .vscode
 server.log
 script.db
+__pycache__
