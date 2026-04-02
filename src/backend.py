@@ -1,15 +1,12 @@
-# podcast_agent.py
+# backend.py
 
-import re
 import sqlite3
-import time
 from typing import Annotated, Literal, TypedDict
 
 from dotenv import load_dotenv
 from langchain_core.messages import AIMessage, AnyMessage, HumanMessage, SystemMessage
 from langchain_core.tools import tool
 from langchain_nvidia_ai_endpoints import ChatNVIDIA
-from langgraph.checkpoint.memory import MemorySaver  # noqa: F401
 from langgraph.checkpoint.sqlite import SqliteSaver
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.message import add_messages
@@ -22,110 +19,7 @@ load_dotenv()
 # LLM Setup
 # ─────────────────────────────────────────────
 
-model = ChatNVIDIA(model="moonshotai/kimi-k2-instruct")
-
-
-# ─────────────────────────────────────────────
-# Retry Wrapper
-# ─────────────────────────────────────────────
-
-
-def invoke_with_retry(llm, prompt, max_retries=5, initial_wait=5):
-    """Invoke the LLM with exponential backoff on rate limit errors."""
-    for attempt in range(max_retries):
-        try:
-            return llm.invoke(prompt)
-        except Exception as e:
-            error_str = str(e)
-            if "429" in error_str or "capacity" in error_str.lower() or "rate" in error_str.lower():
-                wait_time = initial_wait * (2**attempt)
-                print(f"   ⏳ Rate limited (attempt {attempt + 1}/{max_retries}). Waiting {wait_time}s...")
-                time.sleep(wait_time)
-            else:
-                raise
-    return llm.invoke(prompt)
-
-
-# ─────────────────────────────────────────────
-# Script Cleaning Utility
-# ─────────────────────────────────────────────
-
-
-def clean_script_content(raw: str) -> str:
-    """Strip LLM preamble, postamble, stage directions, and normalize formatting."""
-
-    text = raw
-
-    # 1. Normalize markdown speaker labels: **HOST:** → HOST:
-    text = re.sub(r"\*\*(HOST|GUEST):\*\*", r"\1:", text)
-
-    # 2. Remove stage directions in brackets: [laughs], [soft field audio: ...]
-    text = re.sub(r"$$.*?$$", "", text)
-
-    # 3. Remove asterisk-wrapped actions: *laughs*, *chuckling*, *finger-snaps*
-    text = re.sub(r"\*[^*\n]+\*", "", text)
-
-    # 4. Fix compound speaker labels like "HOST and GUEST together:"
-    #    Convert to two separate lines
-    text = re.sub(
-        r"^HOST\s+and\s+GUEST\s*(?:together)?\s*:\s*(.+)$",
-        r"HOST: \1\nGUEST: \1",
-        text,
-        flags=re.MULTILINE | re.IGNORECASE,
-    )
-    # Handle reverse order too
-    text = re.sub(
-        r"^GUEST\s+and\s+HOST\s*(?:together)?\s*:\s*(.+)$",
-        r"GUEST: \1\nHOST: \1",
-        text,
-        flags=re.MULTILINE | re.IGNORECASE,
-    )
-
-    # 5. Ensure each HOST: / GUEST: starts on its own line
-    text = re.sub(r"(?<!\n)\s*(HOST:|GUEST:)", r"\n\1", text)
-
-    # 6. Cut preamble: everything before the first HOST: or GUEST: line
-    match = re.search(r"^(HOST|GUEST):", text, re.MULTILINE)
-    if not match:
-        return raw.strip()
-    text = text[match.start() :]
-
-    # 7. Cut postamble at horizontal rules, markdown headings, or meta-commentary
-    text = re.split(r"\n\s*---\s*\n", text)[0]
-    text = re.split(r"\n\s*#{1,4}\s+", text)[0]
-    text = re.split(
-        r"\n\s*(?:Key (?:Adjustments|Changes)|Changes [Mm]ade|Summary of [Cc]hanges|"
-        r"Note:|Here (?:are|is) |I (?:have|made|kept)|The (?:above|script|rewrite))",
-        text,
-        maxsplit=1,
-    )[0]
-
-    # 8. Clean up leftover whitespace from removed stage directions
-    text = re.sub(r"(HOST:|GUEST:)\s{2,}", r"\1 ", text)
-
-    # 9. Collapse excessive blank lines
-    text = re.sub(r"\n{3,}", "\n\n", text)
-
-    return text.strip()
-
-
-def is_segment_truncated(content: str) -> bool:
-    """Detect if a generated segment was cut off mid-sentence."""
-    stripped = content.strip()
-    if not stripped:
-        return True
-
-    last_line = stripped.split("\n")[-1].strip()
-
-    # Ends with just the speaker label and no/minimal content
-    if re.match(r"^(HOST|GUEST):\s*\S{0,3}$", last_line):
-        return True
-
-    # Doesn't end with sentence-ending punctuation
-    if not re.search(r"[.!?\"')\u2019]$", stripped):
-        return True
-
-    return False
+model = ChatNVIDIA(model="moonshotai/kimi-k2-thinking")
 
 
 # ─────────────────────────────────────────────
@@ -136,6 +30,7 @@ def is_segment_truncated(content: str) -> bool:
 class Segment(BaseModel):
     name: str = Field(description="The name/identifier of this segment (e.g., 'welcome', 'intro', 'discussion', 'outro')")
     description: str = Field(description="Detailed guidelines for writing this segment, including tone, content requirements, and approximate length")
+    estimated_minutes: int = Field(description="Estimated duration of this segment in minutes. All segment durations should sum to the total podcast duration.")
 
 
 class PodcastDetails(BaseModel):
@@ -144,14 +39,13 @@ class PodcastDetails(BaseModel):
     guest_persona: dict = Field(description=("Details about the guest in JSON format that would help build a unique persona with at least 4 traits (e.g. expertise, speaking style, personality quirks, communication approach)"))
     podcast_name: str = Field(description="Name or Title of the podcast")
     platform_name: str = Field(description="Name or Title of the platform hosting the podcast")
+    estimated_duration_minutes: int = Field(description="The estimated total duration of the podcast episode in minutes")
     segments: list[Segment] = Field(
         description=(
-            "A list of segments that make up the podcast structure, in order. Each segment should have a "
-            "name and description. The following segments should be minimally included: welcome (host opens "
-            "the show), intro (guest introduction), discussion (main topic exploration), outro (wrap-up and "
-            "sign-off). You can add, remove, or rename segments based on what makes sense for this specific "
-            "podcast. Try to include a mix of natural and scripted segments with more than the minimally "
-            "required segments."
+            "A list of segments that make up the podcast structure, in order. Each segment should have a name, description, and estimated duration in minutes. "
+            "The sum of all segment durations should equal the total estimated podcast duration. "
+            "The following segments should be minimally included: welcome (host opens the show), intro (guest introduction), discussion (main topic exploration), outro (wrap-up and sign-off). "
+            "You can add, remove, or rename segments based on what makes sense for this specific podcast. Try to include a mix of natural and scripted segments with more than the minimally required segments."
         )
     )
 
@@ -167,7 +61,7 @@ detail_model = model.with_structured_output(PodcastDetails)
 class FinalizeRequirements(BaseModel):
     """Call this tool ONLY when you have gathered ALL the required information from the user."""
 
-    summary: str = Field(description=("A comprehensive summary of everything gathered from the conversation, including: podcast name, platform name, episode topic, host persona details (at least 4 traits), guest persona details (at least 4 traits), and any specific segment preferences."))
+    summary: str = Field(description=("A comprehensive summary of everything gathered from the conversation, including: podcast name, platform name, episode topic, estimated duration, host persona details (at least 4 traits), guest persona details (at least 4 traits), and any specific segment preferences."))
 
 
 @tool("finalize_requirements", args_schema=FinalizeRequirements)
@@ -180,31 +74,35 @@ agent_tools = [finalize_requirements]
 agent_model = model.bind_tools(agent_tools)
 
 AGENT_SYSTEM_PROMPT = """You are a podcast production assistant. Your job is to have a conversation \
-with the user to gather enough information to produce a professional podcast script.
+                        with the user to gather enough information to produce a professional podcast script.
 
-You need to collect ALL of the following before calling finalize_requirements:
+                        You need to collect ALL of the following before calling finalize_requirements:
 
-1. The podcast name
-2. The hosting platform name
-3. The episode topic (with enough detail to write about)
-4. Host persona — at least 4 traits. Ask about: vocabulary level, humor style, catchphrases, energy level, speaking patterns
-5. Guest persona — at least 4 traits. Ask about: area of expertise, speaking style, personality quirks, communication approach
-6. (Optional) Any specific segment preferences or special requests
+                        1. The podcast name
+                        2. The hosting platform name
+                        3. The episode topic (with enough detail to write about)
+                        4. Estimated podcast duration (in minutes — e.g., 15 min, 30 min, 60 min). \
+                           This is important because it determines how many segments to create and how long each one should be.
+                        5. Host persona — at least 4 traits. Ask about: vocabulary level, humor style, catchphrases, energy level, speaking patterns
+                        6. Guest persona — at least 4 traits. Ask about: area of expertise, speaking style, personality quirks, communication approach
+                        7. (Optional) Any specific segment preferences or special requests
 
-Guidelines:
-- Be conversational and friendly.
-- Ask follow-up questions if the user gives vague answers (e.g., "a funny host" → ask what KIND of funny).
-- Summarize what you've gathered before calling finalize_requirements so the user can confirm.
-- Do NOT call finalize_requirements until you have sufficient detail for ALL required fields.
-- If the user provides everything in one message, you can summarize and call finalize_requirements immediately.
+                        Guidelines:
+                        - Be conversational and friendly.
+                        - Ask follow-up questions if the user gives vague answers (e.g., "a funny host" → ask what KIND of funny).
+                        - When asking about duration, give examples of what different durations look like \
+                          (e.g., "15 min is a quick chat, 30 min allows deeper discussion, 60 min is a full deep-dive").
+                        - Summarize what you've gathered before calling finalize_requirements so the user can confirm.
+                        - Do NOT call finalize_requirements until you have sufficient detail for ALL required fields.
+                        - If the user provides everything in one message, you can summarize and call finalize_requirements immediately.
 
-IMPORTANT — When to finalize:
-- If the user explicitly says "that's all", "go ahead", "finalize", or similar, call finalize_requirements \
-IMMEDIATELY. Use the information you already have and fill in reasonable creative defaults for anything missing. \
-Do NOT ask more questions after the user signals they are done.
-- Always include a brief text response acknowledging you are finalizing ALONG WITH the tool call. \
-Example: "Great, I have everything I need! Let me put this together for you." + call finalize_requirements.
-"""
+                        IMPORTANT — When to finalize:
+                        - If the user explicitly says "that's all", "go ahead", "finalize", or similar, call finalize_requirements \
+                        IMMEDIATELY. Use the information you already have and fill in reasonable creative defaults for anything missing. \
+                        Do NOT ask more questions after the user signals they are done.
+                        - Always include a brief text response acknowledging you are finalizing ALONG WITH the tool call. \
+                        Example: "Great, I have everything I need! Let me put this together for you." + call finalize_requirements.
+                        """
 
 
 # ─────────────────────────────────────────────
@@ -218,6 +116,7 @@ class FullState(TypedDict):
     podcast_name: str
     platform_name: str
     topic: str
+    estimated_duration_minutes: int
     host_persona: dict
     guest_persona: dict
     segment_structure: list[dict]
@@ -235,18 +134,18 @@ class FullState(TypedDict):
 # ─────────────────────────────────────────────
 
 SCRIPT_FORMAT_RULES = """Rules:
-• Format every line as HOST: <dialogue> or GUEST: <dialogue>.
-• Each HOST: or GUEST: line MUST start on its own new line.
-• The host's language, vocabulary, and energy MUST reflect their persona.
-• The guest's language, vocabulary, and energy MUST reflect their persona.
-• The dialogue must sound natural — include filler words, reactions, interruptions where appropriate.
-• Do NOT include stage directions, action descriptions, or parentheticals.
-• Do NOT wrap any text in asterisks (*), brackets ([]), or parentheses for actions/sounds/emotions.
-• Do NOT write things like *laughs*, [sighs], (pauses), *claps*, [field audio], etc.
-• Express emotions and actions ONLY through the dialogue words themselves.
-• Output ONLY the script dialogue lines.
-• Do NOT include any preamble, introduction, summary of changes, or commentary.
-• Your response MUST start with HOST: or GUEST: and end with the final line of dialogue."""
+                    • Format every line as HOST: <dialogue> or GUEST: <dialogue>.
+                    • Each HOST: or GUEST: line MUST start on its own new line.
+                    • The host's language, vocabulary, and energy MUST reflect their persona.
+                    • The guest's language, vocabulary, and energy MUST reflect their persona.
+                    • The dialogue must sound natural — include filler words, reactions, interruptions where appropriate.
+                    • Do NOT include stage directions, action descriptions, or parentheticals.
+                    • Do NOT wrap any text in asterisks (*), brackets ([]), or parentheses for actions/sounds/emotions.
+                    • Do NOT write things like *laughs*, [sighs], (pauses), *claps*, [field audio], etc.
+                    • Express emotions and actions ONLY through the dialogue words themselves.
+                    • Output ONLY the script dialogue lines.
+                    • Do NOT include any preamble, introduction, summary of changes, or commentary.
+                    • Your response MUST start with HOST: or GUEST: and end with the final line of dialogue."""
 
 
 # ─────────────────────────────────────────────
@@ -262,6 +161,7 @@ def generate_segment_node(state: FullState) -> FullState:
     topic = state["topic"]
     podcast_name = state["podcast_name"]
     platform_name = state["platform_name"]
+    estimated_duration = state["estimated_duration_minutes"]
     host = state["host_persona"]
     guest = state["guest_persona"]
     segments = list(state.get("segments", []))
@@ -270,62 +170,39 @@ def generate_segment_node(state: FullState) -> FullState:
     current_segment = segment_structure[current_index]
     segment_name = current_segment["name"]
     segment_guideline = current_segment["description"]
+    segment_minutes = current_segment.get("estimated_minutes", "N/A")
 
     # ── Case 1: Re-generate the last segment with human feedback ──
     if feedback and segments:
         last = segments[-1]
         prompt = f"""You are a podcast script writer. Rewrite the following \
-"{last["type"]}" segment based on the reviewer's feedback.
+                "{last["type"]}" segment based on the reviewer's feedback.
 
---- ORIGINAL SEGMENT ---
-{last["content"]}
+                --- ORIGINAL SEGMENT ---
+                {last["content"]}
 
---- REVIEWER FEEDBACK ---
-{feedback}
+                --- REVIEWER FEEDBACK ---
+                {feedback}
 
---- CONTEXT ---
-Podcast Name  : {podcast_name}
-Platform Name : {platform_name}
-Topic         : {topic}
-Host          : {host}
-Guest         : {guest}
+                --- CONTEXT ---
+                Podcast Name : {podcast_name}
+                Platform Name : {platform_name}
+                Topic : {topic}
+                Total Podcast Duration : {estimated_duration} minutes
+                This Segment Duration  : {segment_minutes} minutes
+                Host : {host}
+                Guest : {guest}
 
-{SCRIPT_FORMAT_RULES}
+                {SCRIPT_FORMAT_RULES}
 
-Additional rewrite rules:
-• Apply the feedback precisely; do not change anything the reviewer didn't mention.
-• Keep the same overall structure and flow of the segment."""
+                Additional rewrite rules:
+                • Apply the feedback precisely; do not change anything the reviewer didn't mention.
+                • Keep the same overall structure and flow of the segment.
+                • Keep the dialogue length appropriate for approximately {segment_minutes} minutes of spoken audio.
+                • Only provide the updated script without any additional text."""
 
-        response = invoke_with_retry(model, prompt)
-        content = clean_script_content(response.content)
-
-        # Handle truncation in rewrite
-        max_continuations = 3
-        for _ in range(max_continuations):
-            if not is_segment_truncated(content):
-                break
-            continuation_prompt = f"""You are a podcast script writer. Continue the following \
-"{last["type"]}" segment EXACTLY where it left off. Pick up mid-sentence if needed.
-
---- SEGMENT SO FAR ---
-{content}
-
---- CONTEXT ---
-Podcast Name  : {podcast_name}
-Platform Name : {platform_name}
-Topic         : {topic}
-Host          : {host}
-Guest         : {guest}
-
-{SCRIPT_FORMAT_RULES}
-
-Additional rules:
-• Start IMMEDIATELY where the text above ended — do not repeat any lines.
-• Complete the segment naturally and bring it to a proper conclusion."""
-
-            cont_response = invoke_with_retry(model, continuation_prompt)
-            cont_clean = clean_script_content(cont_response.content)
-            content = content + "\n" + cont_clean
+        response = model.invoke(prompt)
+        content = response.content
 
         segments[-1] = {
             "type": last["type"],
@@ -340,49 +217,27 @@ Additional rules:
         previous_context = f"Here are the segments generated so far (for continuity):\n{prev_text}\n\n"
 
     prompt = f"""You are a podcast script writer. Write the \
-"{segment_name}" segment for a podcast episode.
+            "{segment_name}" segment for a podcast episode.
 
-Podcast Name  : {podcast_name}
-Platform Name : {platform_name}
-Topic         : {topic}
-Host persona  : {host}
-Guest persona : {guest}
+            Podcast Name : {podcast_name}
+            Platform Name : {platform_name}
+            Topic : {topic}
+            Total Podcast Duration : {estimated_duration} minutes
+            This Segment Duration  : {segment_minutes} minutes
+            Host persona : {host}
+            Guest persona : {guest}
 
-Segment guidelines: {segment_guideline}
+            Segment guidelines: {segment_guideline}
 
-{previous_context}
-{SCRIPT_FORMAT_RULES}"""
+            IMPORTANT: This segment should contain enough dialogue to fill approximately \
+            {segment_minutes} minutes of spoken audio. As a rough guide, 1 minute of natural \
+            conversation is about 120-150 words. So aim for roughly {int(segment_minutes) * 135 if isinstance(segment_minutes, int) else 'an appropriate number of'} words.
 
-    response = invoke_with_retry(model, prompt)
-    content = clean_script_content(response.content)
+            {previous_context}
+            {SCRIPT_FORMAT_RULES}"""
 
-    # Handle truncation — continue generating until complete
-    max_continuations = 3
-    for _ in range(max_continuations):
-        if not is_segment_truncated(content):
-            break
-        continuation_prompt = f"""You are a podcast script writer. Continue the following \
-"{segment_name}" segment EXACTLY where it left off. Pick up mid-sentence if needed.
-
---- SEGMENT SO FAR ---
-{content}
-
---- CONTEXT ---
-Podcast Name  : {podcast_name}
-Platform Name : {platform_name}
-Topic         : {topic}
-Host          : {host}
-Guest         : {guest}
-
-{SCRIPT_FORMAT_RULES}
-
-Additional rules:
-• Start IMMEDIATELY where the text above ended — do not repeat any lines.
-• Complete the segment naturally and bring it to a proper conclusion."""
-
-        cont_response = invoke_with_retry(model, continuation_prompt)
-        cont_clean = clean_script_content(cont_response.content)
-        content = content + "\n" + cont_clean
+    response = model.invoke(prompt)
+    content = response.content
 
     segments.append(
         {
@@ -437,7 +292,7 @@ def agent_chat_node(state: FullState) -> FullState:
     if not has_system:
         messages = [SystemMessage(content=AGENT_SYSTEM_PROMPT)] + list(messages)
 
-    response = invoke_with_retry(agent_model, messages)
+    response = agent_model.invoke(messages)
     return {"messages": [response]}
 
 
@@ -455,9 +310,16 @@ def parse_input_node(state: FullState) -> FullState:
     """Extract structured podcast details from the agent conversation."""
     conversation = "\n".join(f"{msg.type}: {msg.content}" for msg in state["messages"] if hasattr(msg, "content") and msg.content)
 
-    details = invoke_with_retry(detail_model, conversation)
+    details = detail_model.invoke(conversation)
 
-    segment_structure = [{"name": seg.name, "description": seg.description} for seg in details.segments]
+    segment_structure = [
+        {
+            "name": seg.name,
+            "description": seg.description,
+            "estimated_minutes": seg.estimated_minutes,
+        }
+        for seg in details.segments
+    ]
 
     return {
         "topic": details.topic,
@@ -465,6 +327,7 @@ def parse_input_node(state: FullState) -> FullState:
         "guest_persona": details.guest_persona,
         "podcast_name": details.podcast_name,
         "platform_name": details.platform_name,
+        "estimated_duration_minutes": details.estimated_duration_minutes,
         "segment_structure": segment_structure,
         "requirements_confirmed": False,
         "current_segment_index": 0,
@@ -552,6 +415,71 @@ graph.add_conditional_edges(
 conn = sqlite3.connect("script.db", check_same_thread=False)
 memory = SqliteSaver(conn=conn)
 
+
+# ─────────────────────────────────────────────
+# Thread Management Helpers (Persistent Metadata)
+# ─────────────────────────────────────────────
+
+
+def _init_thread_metadata_table():
+    """Create the thread_metadata table if it doesn't exist."""
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS thread_metadata (
+            thread_id TEXT PRIMARY KEY,
+            display_name TEXT NOT NULL
+        )
+        """
+    )
+    conn.commit()
+
+
+_init_thread_metadata_table()
+
+
+def rename_thread(thread_id: str, display_name: str):
+    """Set or update the display name for a thread."""
+    conn.execute(
+        "INSERT OR REPLACE INTO thread_metadata (thread_id, display_name) VALUES (?, ?)",
+        (thread_id, display_name),
+    )
+    conn.commit()
+
+
+def get_thread_name(thread_id: str) -> str | None:
+    """Get the display name for a thread, or None if not set."""
+    cursor = conn.execute(
+        "SELECT display_name FROM thread_metadata WHERE thread_id = ?",
+        (thread_id,),
+    )
+    row = cursor.fetchone()
+    return row[0] if row else None
+
+
+def get_all_thread_metadata() -> dict[str, str]:
+    """Get all thread_id → display_name mappings."""
+    cursor = conn.execute("SELECT thread_id, display_name FROM thread_metadata")
+    return {row[0]: row[1] for row in cursor.fetchall()}
+
+
+def delete_thread(thread_id: str):
+    """Delete all checkpoint data and metadata for a thread."""
+    # Discover checkpoint tables dynamically to handle different SqliteSaver versions
+    cursor = conn.execute("SELECT name FROM sqlite_master WHERE type='table'")
+    all_tables = {row[0] for row in cursor.fetchall()}
+
+    for table in ["checkpoints", "checkpoint_writes", "checkpoint_blobs"]:
+        if table in all_tables:
+            conn.execute(f"DELETE FROM {table} WHERE thread_id = ?", (thread_id,))
+
+    conn.execute("DELETE FROM thread_metadata WHERE thread_id = ?", (thread_id,))
+    conn.commit()
+
+
+# ─────────────────────────────────────────────
+# Compile Graph
+# ─────────────────────────────────────────────
+
 app = graph.compile(
     interrupt_before=["confirm_requirements", "human_interrupt"],
     checkpointer=memory,
@@ -600,16 +528,20 @@ def print_podcast_plan(snapshot):
     print(f"Podcast Name : {vals.get('podcast_name', 'N/A')}")
     print(f"Platform     : {vals.get('platform_name', 'N/A')}")
     print(f"Topic        : {vals.get('topic', 'N/A')}")
+    print(f"Est. Duration: {vals.get('estimated_duration_minutes', 'N/A')} minutes")
     print("\nHost Persona:")
     for k, v in vals.get("host_persona", {}).items():
         print(f"  {k}: {v}")
     print("\nGuest Persona:")
     for k, v in vals.get("guest_persona", {}).items():
         print(f"  {k}: {v}")
-    print(f"\nSegment Structure ({len(vals.get('segment_structure', []))} segments):")
-    for i, seg in enumerate(vals.get("segment_structure", []), 1):
+    segment_structure = vals.get("segment_structure", [])
+    total_seg_minutes = sum(s.get("estimated_minutes", 0) for s in segment_structure)
+    print(f"\nSegment Structure ({len(segment_structure)} segments, ~{total_seg_minutes} min total):")
+    for i, seg in enumerate(segment_structure, 1):
         desc = seg["description"]
-        print(f"  {i}. {seg['name']}: {desc[:80]}{'...' if len(desc) > 80 else ''}")
+        mins = seg.get("estimated_minutes", "?")
+        print(f"  {i}. {seg['name']} (~{mins} min): {desc[:70]}{'...' if len(desc) > 70 else ''}")
     print_separator()
 
 
@@ -617,7 +549,7 @@ def print_final_script(snapshot):
     vals = snapshot.values
     print_separator()
     print(f"FINAL SCRIPT: {vals.get('podcast_name', 'Podcast')}")
-    print(f"Platform: {vals.get('platform_name', '')} | Topic: {vals.get('topic', '')}")
+    print(f"Platform: {vals.get('platform_name', '')} | Topic: {vals.get('topic', '')} | Duration: ~{vals.get('estimated_duration_minutes', '?')} min")
     print_separator()
     for seg in vals.get("segments", []):
         print(f"\n{'=' * 50}")
@@ -646,6 +578,7 @@ def get_agent_response_text(result: dict) -> tuple[str, bool]:
 
     return text, has_tool_call
 
+
 def get_user_input(prompt_text: str = "YOU: ") -> str:
     """Get input from user, handling KeyboardInterrupt gracefully."""
     try:
@@ -653,20 +586,24 @@ def get_user_input(prompt_text: str = "YOU: ") -> str:
     except (KeyboardInterrupt, EOFError):
         print("\n\n👋 Session ended by user.")
         exit(0)
-        
+
+
 def print_segment_for_review(snapshot, max_segments):
     segments = snapshot.values.get("segments", [])
     if not segments:
         return
     latest = segments[-1]
     num = len(segments)
+    segment_structure = snapshot.values.get("segment_structure", [])
+    seg_minutes = "?"
+    if num - 1 < len(segment_structure):
+        seg_minutes = segment_structure[num - 1].get("estimated_minutes", "?")
     print(f"\n{'─' * 50}")
-    print(f"  📝 SEGMENT {num}/{max_segments}: {latest['type'].upper()}")
+    print(f"  📝 SEGMENT {num}/{max_segments}: {latest['type'].upper()} (~{seg_minutes} min)")
     print(f"{'─' * 50}\n")
     print(latest["content"])
     print()
-
-
+    
 # ─────────────────────────────────────────────
 # Sample Test Run
 # ─────────────────────────────────────────────
@@ -719,8 +656,6 @@ if __name__ == "__main__":
             print(f"\n🤖 AGENT: {ai_text}\n")
         if tool_called:
             print("   🔧 Finalizing requirements...\n")
-            # Tool was called but we need to check if graph continued past tools→parse_input
-            # and landed at confirm_requirements
             snapshot = app.get_state(config)
             if snapshot.next and "confirm_requirements" in snapshot.next:
                 break
@@ -751,12 +686,10 @@ if __name__ == "__main__":
             exit(0)
 
         if not user_input:
-            # User confirmed — resume the graph
             print("\n✅ Plan confirmed. Generating script...\n")
             result = app.invoke(None, config)
             break
         else:
-            # User wants changes — reject confirmation and send back to agent
             print("\n🔄 Sending your feedback to the assistant...\n")
             app.update_state(
                 config,
@@ -768,8 +701,6 @@ if __name__ == "__main__":
             )
             result = app.invoke(None, config)
 
-            # This routes to agent_chat → agent responds → may finalize again
-            # Loop until we're back at confirm_requirements
             while True:
                 snapshot = app.get_state(config)
 
@@ -779,7 +710,6 @@ if __name__ == "__main__":
                     break
 
                 if not snapshot.next:
-                    # Agent responded with text, waiting for user
                     ai_text, tool_called = get_agent_response_text(result)
                     if ai_text:
                         print(f"🤖 AGENT: {ai_text}\n")
@@ -806,16 +736,13 @@ if __name__ == "__main__":
     while True:
         snapshot = app.get_state(config)
 
-        # Graph complete
         if not snapshot.next:
             break
 
-        # Not at human_interrupt — resume automatically
         if "human_interrupt" not in snapshot.next:
             result = app.invoke(None, config)
             continue
 
-        # Display the generated segment
         print_segment_for_review(snapshot, max_segments)
 
         current_segments = snapshot.values.get("segments", [])
@@ -838,12 +765,10 @@ if __name__ == "__main__":
                 exit(0)
 
             if not user_input:
-                # Accept — resume graph (human_interrupt passthrough → check_completion → next)
                 print(f"\n   ✅ Accepted: {seg_name}\n")
                 result = app.invoke(None, config)
                 break
             else:
-                # Feedback — inject and resume (routes back to generate_segment → regenerates)
                 print("\n   🔄 Regenerating with feedback...\n")
                 app.update_state(
                     config,
@@ -852,14 +777,11 @@ if __name__ == "__main__":
                 )
                 result = app.invoke(None, config)
 
-                # After regeneration, we're back at human_interrupt with the new version
                 snapshot = app.get_state(config)
                 if snapshot.next and "human_interrupt" in snapshot.next:
                     print_segment_for_review(snapshot, max_segments)
-                    # Loop back to ask for decision on the regenerated version
                     continue
                 else:
-                    # Unexpected — break inner loop, outer loop will handle
                     break
 
     # ──────────────────────────────────────────
@@ -871,4 +793,5 @@ if __name__ == "__main__":
 
     total = len(snapshot.values.get("segments", []))
     print(f"\n📊 Total segments: {total}/{max_segments}")
+    print(f"⏱️  Target duration: {snapshot.values.get('estimated_duration_minutes', '?')} minutes")
     print(f"🏁 Complete: {snapshot.values.get('is_complete', False)}")

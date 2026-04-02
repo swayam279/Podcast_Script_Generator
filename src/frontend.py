@@ -5,8 +5,14 @@ import uuid
 import streamlit as st
 from langchain_core.messages import AIMessage, HumanMessage
 
-# Import app — backend.py must use SqliteSaver with proper connection
-from backend import app, memory
+from backend import (
+    app,
+    delete_thread,
+    get_all_thread_metadata,
+    get_thread_name,
+    memory,
+    rename_thread,
+)
 
 # ─────────────────────────────────────────────
 # Page Config
@@ -33,27 +39,31 @@ def get_config():
 
 
 def retrieve_all_threads():
-    """Retrieve all thread IDs from the checkpoint store."""
+    """Retrieve all thread IDs from the checkpoint store and their display names."""
     all_threads = set()
-    try:
-        for cpt in memory.list(None):
-            tid = cpt.config.get("configurable", {}).get("thread_id")
-            if tid:
-                all_threads.add(tid)
-    except Exception:
-        pass
-    return list(all_threads)
+    for cpt in memory.list(None):
+        tid = cpt.config.get("configurable", {}).get("thread_id")
+        if tid:
+            all_threads.add(tid)
+
+    # Load display names from metadata table
+    metadata = get_all_thread_metadata()
+
+    # Build ordered list — threads with metadata first, then any orphan checkpoint threads
+    thread_list = []
+    for tid in all_threads:
+        thread_list.append(tid)
+        # Ensure all checkpoint threads have a metadata entry
+        if tid not in metadata:
+            rename_thread(tid, tid[:8])
+
+    return thread_list
 
 
 def load_session_state(thread_id):
     """Load full graph state for a thread and reconstruct UI state."""
     config = {"configurable": {"thread_id": thread_id}}
-    try:
-        snapshot = app.get_state(config)
-    except Exception:
-        st.session_state["phase"] = "chat"
-        st.session_state["chat_history"] = []
-        return
+    snapshot = app.get_state(config)
 
     if not snapshot or not snapshot.values:
         st.session_state["phase"] = "chat"
@@ -96,6 +106,9 @@ def reset_session():
     st.session_state["chat_history"] = []
     st.session_state["phase"] = "chat"
     st.session_state["plan_reviewed"] = False
+    # Save default display name
+    default_name = f"New Podcast ({thread_id[:8]})"
+    rename_thread(thread_id, default_name)
     add_thread(thread_id)
 
 
@@ -105,10 +118,13 @@ def add_thread(thread_id):
 
 
 def get_snapshot():
-    try:
-        return app.get_state(get_config())
-    except Exception:
-        return None
+    return app.get_state(get_config())
+
+
+def get_display_name(thread_id):
+    """Get the display name for a thread, falling back to truncated ID."""
+    name = get_thread_name(thread_id)
+    return name if name else thread_id[:8]
 
 
 def get_plan_display(snapshot):
@@ -117,6 +133,7 @@ def get_plan_display(snapshot):
     lines.append(f"**Podcast Name:** {vals.get('podcast_name', 'N/A')}")
     lines.append(f"**Platform:** {vals.get('platform_name', 'N/A')}")
     lines.append(f"**Topic:** {vals.get('topic', 'N/A')}")
+    lines.append(f"**Estimated Duration:** {vals.get('estimated_duration_minutes', 'N/A')} minutes")
     lines.append("")
     lines.append("**Host Persona:**")
     for k, v in vals.get("host_persona", {}).items():
@@ -127,10 +144,12 @@ def get_plan_display(snapshot):
         lines.append(f"- {k}: {v}")
     lines.append("")
     segments = vals.get("segment_structure", [])
-    lines.append(f"**Segments ({len(segments)}):**")
+    total_seg_minutes = sum(s.get("estimated_minutes", 0) for s in segments)
+    lines.append(f"**Segments ({len(segments)} segments, ~{total_seg_minutes} min total):**")
     for i, seg in enumerate(segments, 1):
         desc = seg["description"]
-        lines.append(f"{i}. **{seg['name']}**: {desc[:100]}{'...' if len(desc) > 100 else ''}")
+        mins = seg.get("estimated_minutes", "?")
+        lines.append(f"{i}. **{seg['name']}** (~{mins} min): {desc[:100]}{'...' if len(desc) > 100 else ''}")
     return "\n".join(lines)
 
 
@@ -153,6 +172,9 @@ if "phase" not in st.session_state:
 if "plan_reviewed" not in st.session_state:
     st.session_state["plan_reviewed"] = False
 
+if "renaming_thread" not in st.session_state:
+    st.session_state["renaming_thread"] = None
+
 add_thread(st.session_state["session_id"])
 
 # ─────────────────────────────────────────────
@@ -170,13 +192,64 @@ st.sidebar.divider()
 st.sidebar.subheader("Sessions")
 
 for thread_id in st.session_state["chat_threads"][::-1]:
-    label = f"🧵 {thread_id[:8]}..."
-    if thread_id == st.session_state["session_id"]:
-        label = f"▶ {thread_id[:8]}... (active)"
-    if st.sidebar.button(label, key=f"thread_{thread_id}", use_container_width=True):
-        st.session_state["session_id"] = thread_id
-        load_session_state(thread_id)
-        st.rerun()
+    is_active = thread_id == st.session_state["session_id"]
+    display_name = get_display_name(thread_id)
+
+    # ── Rename mode for this thread ──
+    if st.session_state["renaming_thread"] == thread_id:
+        with st.sidebar.container():
+            new_name = st.text_input(
+                "New name:",
+                value=display_name,
+                key=f"rename_input_{thread_id}",
+                label_visibility="collapsed",
+            )
+            rcol1, rcol2 = st.columns(2)
+            with rcol1:
+                if st.button("✅", key=f"rename_save_{thread_id}", use_container_width=True):
+                    if new_name.strip():
+                        rename_thread(thread_id, new_name.strip())
+                    st.session_state["renaming_thread"] = None
+                    st.rerun()
+            with rcol2:
+                if st.button("❌", key=f"rename_cancel_{thread_id}", use_container_width=True):
+                    st.session_state["renaming_thread"] = None
+                    st.rerun()
+        continue
+
+    # ── Normal display ──
+    label_prefix = "▶ " if is_active else "🧵 "
+    label_suffix = " (active)" if is_active else ""
+    label = f"{label_prefix}{display_name}{label_suffix}"
+
+    col_main, col_rename, col_delete = st.sidebar.columns([6, 1, 1])
+
+    with col_main:
+        if st.button(label, key=f"thread_{thread_id}", use_container_width=True):
+            st.session_state["session_id"] = thread_id
+            load_session_state(thread_id)
+            st.rerun()
+
+    with col_rename:
+        if st.button("✏️", key=f"rename_btn_{thread_id}", use_container_width=True):
+            st.session_state["renaming_thread"] = thread_id
+            st.rerun()
+
+    with col_delete:
+        if st.button("🗑️", key=f"delete_btn_{thread_id}", use_container_width=True):
+            # Delete the thread from DB and local state
+            delete_thread(thread_id)
+            st.session_state["chat_threads"].remove(thread_id)
+
+            # If we deleted the active session, create a new one
+            if thread_id == st.session_state["session_id"]:
+                reset_session()
+
+            # Clear rename state if it was targeting the deleted thread
+            if st.session_state["renaming_thread"] == thread_id:
+                st.session_state["renaming_thread"] = None
+
+            st.rerun()
 
 st.sidebar.divider()
 phase_labels = {
@@ -261,6 +334,14 @@ elif st.session_state["phase"] == "review_plan":
         plan_text = get_plan_display(snapshot)
         st.markdown(plan_text)
 
+        # Auto-rename the session to the podcast name if still using default
+        vals = snapshot.values
+        podcast_name = vals.get("podcast_name", "")
+        if podcast_name:
+            current_name = get_display_name(st.session_state["session_id"])
+            if current_name.startswith("New Podcast (") or current_name == st.session_state["session_id"][:8]:
+                rename_thread(st.session_state["session_id"], podcast_name)
+
         st.divider()
 
         col1, col2 = st.columns(2)
@@ -275,12 +356,14 @@ elif st.session_state["phase"] == "review_plan":
         with col2:
             feedback = st.text_area(
                 "Want changes? Describe what to adjust:",
-                placeholder="e.g., 'Add a rapid-fire Q&A segment'",
+                placeholder="e.g., 'Make it 45 minutes instead' or 'Add a rapid-fire Q&A segment'",
                 key="plan_feedback",
             )
             if st.button("🔄 Revise Plan", use_container_width=True):
                 if feedback:
                     with st.spinner("Revising plan..."):
+                        st.session_state["chat_history"].append({"role": "user", "content": feedback})
+
                         app.update_state(
                             config,
                             {
@@ -291,24 +374,21 @@ elif st.session_state["phase"] == "review_plan":
                         )
                         result = app.invoke(None, config)
 
-                        max_attempts = 10
-                        for _ in range(max_attempts):
-                            snapshot = app.get_state(config)
-                            if snapshot.next and "confirm_requirements" in snapshot.next:
-                                break
-                            if not snapshot.next:
-                                ai_text = ""
-                                for msg in reversed(result.get("messages", [])):
-                                    if isinstance(msg, AIMessage) and msg.content:
-                                        ai_text = msg.content
-                                        break
-                                if ai_text:
-                                    st.session_state["chat_history"].append({"role": "assistant", "content": ai_text})
-                                st.session_state["phase"] = "chat"
-                                st.rerun()
-                            result = app.invoke(None, config)
+                        snapshot = app.get_state(config)
 
-                    st.rerun()
+                        if snapshot.next and "confirm_requirements" in snapshot.next:
+                            for msg in reversed(result.get("messages", [])):
+                                if isinstance(msg, AIMessage) and msg.content:
+                                    st.session_state["chat_history"].append({"role": "assistant", "content": msg.content})
+                                    break
+                            st.rerun()
+                        else:
+                            for msg in reversed(result.get("messages", [])):
+                                if isinstance(msg, AIMessage) and msg.content:
+                                    st.session_state["chat_history"].append({"role": "assistant", "content": msg.content})
+                                    break
+                            st.session_state["phase"] = "chat"
+                            st.rerun()
                 else:
                     st.warning("Please enter your feedback before clicking Revise.")
     else:
@@ -341,7 +421,9 @@ elif st.session_state["phase"] == "review_segments":
         if num_done > 1:
             with st.expander(f"✅ Accepted Segments ({num_done - 1}/{max_segments})", expanded=False):
                 for i, seg in enumerate(current_segments[:-1], 1):
-                    st.markdown(f"**{i}. {seg['type']}**")
+                    seg_structure = vals.get("segment_structure", [])
+                    seg_mins = seg_structure[i - 1].get("estimated_minutes", "?") if i - 1 < len(seg_structure) else "?"
+                    st.markdown(f"**{i}. {seg['type']}** (~{seg_mins} min)")
                     st.code(seg["content"], language=None)
                     st.divider()
 
@@ -356,7 +438,9 @@ elif st.session_state["phase"] == "review_segments":
 
         if current_segments:
             latest = current_segments[-1]
-            st.subheader(f"📝 Segment {num_done}/{max_segments}: {latest['type']}")
+            seg_structure = vals.get("segment_structure", [])
+            seg_mins = seg_structure[num_done - 1].get("estimated_minutes", "?") if num_done - 1 < len(seg_structure) else "?"
+            st.subheader(f"📝 Segment {num_done}/{max_segments}: {latest['type']} (~{seg_mins} min)")
             st.progress(num_done / max_segments, text=f"Progress: {num_done}/{max_segments} segments")
             st.code(latest["content"], language=None)
 
@@ -376,7 +460,7 @@ elif st.session_state["phase"] == "review_segments":
             with col2:
                 feedback = st.text_area(
                     "Feedback to regenerate this segment:",
-                    placeholder="e.g., 'Make the host less aggressive'",
+                    placeholder="e.g., 'Make it shorter' or 'Make the host less aggressive'",
                     key=f"segment_feedback_{num_done}",
                 )
                 if st.button("🔄 Regenerate", use_container_width=True):
@@ -408,18 +492,21 @@ elif st.session_state["phase"] == "complete":
         vals = snapshot.values
         total = len(vals.get("segments", []))
         max_segments = len(vals.get("segment_structure", []))
+        duration = vals.get("estimated_duration_minutes", "?")
 
         st.balloons()
 
         st.subheader(f"🎬 {vals.get('podcast_name', 'Your Podcast')} — Complete Script")
-        st.caption(f"Platform: {vals.get('platform_name', '')} | Topic: {vals.get('topic', '')}")
+        st.caption(f"Platform: {vals.get('platform_name', '')} | Topic: {vals.get('topic', '')} | Duration: ~{duration} min")
         st.caption(f"✅ {total}/{max_segments} segments generated")
 
         with st.expander("📋 Podcast Plan", expanded=False):
             st.markdown(get_plan_display(snapshot))
 
         for i, seg in enumerate(vals.get("segments", []), 1):
-            with st.expander(f"📝 {i}. {seg['type']}", expanded=True):
+            seg_structure = vals.get("segment_structure", [])
+            seg_mins = seg_structure[i - 1].get("estimated_minutes", "?") if i - 1 < len(seg_structure) else "?"
+            with st.expander(f"📝 {i}. {seg['type']} (~{seg_mins} min)", expanded=True):
                 st.code(seg["content"], language=None)
 
         st.divider()
@@ -427,13 +514,16 @@ elif st.session_state["phase"] == "complete":
         col1, col2 = st.columns(2)
 
         with col1:
+            seg_structure = vals.get("segment_structure", [])
             script_text = f"PODCAST: {vals.get('podcast_name', 'Podcast')}\n"
             script_text += f"PLATFORM: {vals.get('platform_name', '')}\n"
             script_text += f"TOPIC: {vals.get('topic', '')}\n"
+            script_text += f"ESTIMATED DURATION: ~{duration} minutes\n"
             script_text += "=" * 60 + "\n\n"
-            for seg in vals.get("segments", []):
+            for i, seg in enumerate(vals.get("segments", []), 1):
+                seg_mins = seg_structure[i - 1].get("estimated_minutes", "?") if i - 1 < len(seg_structure) else "?"
                 script_text += f"\n{'=' * 40}\n"
-                script_text += f"  {seg['type'].upper()}\n"
+                script_text += f"  {seg['type'].upper()} (~{seg_mins} min)\n"
                 script_text += f"{'=' * 40}\n\n"
                 script_text += seg["content"] + "\n"
 
